@@ -15,18 +15,24 @@ SCCP_XUDT = 0x11
 CONFIG = {
     'local_gt': '817085811990',
     'local_pc': 641,
-    'remote_gt': '817090514560',
-    'remote_pc': 2120,
+    'remote_gt': '817090514123',
+    'remote_pc': 2320,
     'route_context': 34,
     'ssn': 6,          
     'network_indicator': 3,                        
     'hlr_gt': '817085811990',                   
     'msc_gt': '817085811990',                           
     'vlr_gt': '817085811990',   
-    'smsc_gt': '817090514123',
+    'smsc_gt': '817090514560',
     'fsmsc_gt': '886932000001',
     'log_level': 'INFO'                     
 }
+CONFIG_SRI_RESP = {
+    "81708*":       {"nnn": "817085811991", "imsi": "444110111111111"},
+    "886932222222": {"nnn": "886932000001", "imsi": "466920222222222"},
+    "886936*":      {"nnn": "886936000001", "imsi": "466010333333333"},
+}
+
 ACN_SHORTMSG_GATEWAY_V3 = "0.4.0.0.1.0.20.3"                                       
 ACN_SHORTMSG_MO_RELAY_V3 = "0.4.0.0.1.0.21.3"                                             
 ACN_SHORTMSG_MT_RELAY_V3 = "0.4.0.0.1.0.25.3"                                             
@@ -245,10 +251,14 @@ class MAPSIGTRANServer:
         try:
             # Show PID/DCS/TXT preview for MO/MT SMS
             if isinstance(op_code, int) and op_code in (MAP_MO_FSM, MAP_MT_FSM) and tcap_data:
-                pid, dcs, preview = self._extract_pid_dcs_preview(tcap_data, op_code, max_chars=10)
+                pid, dcs, preview = self._extract_pid_dcs_preview(tcap_data, op_code, max_chars=160)
                 if pid is not None and dcs is not None and preview is not None:
                     preview = preview.replace("\n", "\\n").replace("\r", "\\r")
-                    extra = f" PID=0x{pid:02X} DCS=0x{dcs:02X} TXT='{preview}'"
+                    
+                    ui_len = len(preview)
+                    len_part = f" LEN={ui_len}" if ui_len else ""
+                    extra = f"PID=0x{pid:02X} DCS=0x{dcs:02X} {len_part} TXT='{preview}'"
+
     
             # NEW: For SRI-SM ReturnResultLast, append IMSI and NNN (MSC GT) decoded from MAP PDU
             elif isinstance(op_code, int) and op_code == MAP_SRI_SM and tcap_data and comp_tag == 0xA2:
@@ -267,21 +277,15 @@ class MAPSIGTRANServer:
             f"{direction} "
             f"{opc:<5} -> {dpc:<5} "
             f"TID={self._format_tid(tid)} "
-            f"{calling_gt or '-'} -> {called_gt or '-'} "
+            f"{calling_gt or '-'} -> {called_gt or '-':<18} "
             f"SCA={sca_str or 'NA':<14} "
             f"{op_name}{ack_suffix}{extra} "
         )
         self.log_info(line)
-    
+
+   
     def _extract_pid_dcs_preview(self, tcap_data: bytes, op_code: int, max_chars: int = 10):
-        """
-        Extract PID, DCS and a short human-readable text preview from a MAP SMS operation.
-        Changes:
-          1) Prefer parsing candidates as raw TPDU first (works when SM-RP-UI carries a bare TPDU).
-          2) Fallback to RPDU container parsing (SM-RP-UI contains RP-User-Data IE 0x04 with TPDU).
-          3) Fix SMS-SUBMIT VPF=0 handling (no 'continue'; proceed to UDL parsing).
-          4) Optional: slightly richer GSM 7-bit base mapping to reduce '?' in previews.
-        """
+       
         try:
             comp = self._extract_component_portion(tcap_data)
             if not comp:
@@ -1339,6 +1343,37 @@ class MAPSIGTRANServer:
         if len(imsi) != 15:
             imsi = imsi[:15].ljust(15, '0')
         return imsi
+    def _lookup_sri_profile(self, msisdn: str) -> dict:
+        """
+        Return mapping for this MSISDN from CONFIG_SRI_RESP.
+        Matching priority:
+          1) Exact match
+          2) Longest prefix rule ending with '*'
+        Returns {} if no match (so callers can fall back cleanly).
+        """
+        try:
+            cfg = globals().get('CONFIG_SRI_RESP', {}) or {}
+            if not isinstance(cfg, dict):
+                return {}
+    
+            # 1) exact
+            if msisdn in cfg and isinstance(cfg[msisdn], dict):
+                return cfg[msisdn]
+    
+            # 2) longest prefix (rule key ends with '*')
+            best = None
+            best_len = -1
+            for k, v in cfg.items():
+                if isinstance(k, str) and k.endswith('*') and isinstance(v, dict):
+                    pre = k[:-1]
+                    if msisdn.startswith(pre) and len(pre) > best_len:
+                        best = v
+                        best_len = len(pre)
+    
+            return best or {}
+        except Exception:
+            return {}
+    
     def encode_bcd_digits(self, digits_str):
         digits = digits_str
         if len(digits) % 2:
@@ -1737,6 +1772,17 @@ class MAPSIGTRANServer:
             invoke_id &= 0xFF
         imsi = self.generate_imsi(msisdn)
         nnn_gt = CONFIG['msc_gt']
+
+        profile = self._lookup_sri_profile(msisdn)
+        if profile:
+          if profile.get('imsi'):
+            imsi = ''.join(ch for ch in str(profile['imsi']) if ch.isdigit())
+          if profile.get('nnn'):
+            nnn_gt = ''.join(ch for ch in str(profile['nnn']) if ch.isdigit())
+          self.log_debug(f"[SRI-SM RESP] MSISDN={msisdn} -> (mapped) NNN={nnn_gt}, IMSI={imsi}")
+        else:
+          self.log_debug(f"[SRI-SM RESP] MSISDN={msisdn} -> (default) NNN={nnn_gt}, IMSI={imsi}")
+
         ton_npi = 0x91
         nnn_bcd = self.encode_bcd_digits(nnn_gt)
         nnn_address_string = bytes([ton_npi]) + nnn_bcd
