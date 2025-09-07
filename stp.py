@@ -1,5 +1,5 @@
 #!/usr/bin/python
-### script for test in lab environment only , do not use in production environment
+### python 3.8 script for test in lab environment only , do not use in production environment
 import socket
 import struct
 import threading
@@ -10,14 +10,12 @@ import os
 import sys
 from datetime import datetime
 from typing import Optional, List, Tuple
-from datetime import datetime
-import logging
 IPPROTO_SCTP = 132
 SCCP_XUDT = 0x11                    
 CONFIG = {
     'local_gt': '817085811990',
     'local_pc': 641,
-    'remote_gt': '817090515123',
+    'remote_gt': '817090514560',
     'remote_pc': 2120,
     'route_context': 34,
     'ssn': 6,          
@@ -25,14 +23,13 @@ CONFIG = {
     'hlr_gt': '817085811990',                   
     'msc_gt': '817085811990',                           
     'vlr_gt': '817085811990',   
-    'smsc_gt': '817090515123',
+    'smsc_gt': '817090514123',
     'fsmsc_gt': '886932000001',
     'log_level': 'INFO'                     
 }
-# --- MAP Application Context Names (ACNs), 3GPP TS 29.002 ---
-ACN_SHORTMSG_GATEWAY_V3 = "0.4.0.0.1.0.20.3"   # SRI-SM (shortMsgGatewayContext-v3)
-ACN_SHORTMSG_MO_RELAY_V3 = "0.4.0.0.1.0.21.3"  # MO-ForwardSM (shortMsgMO-RelayContext-v3)
-ACN_SHORTMSG_MT_RELAY_V3 = "0.4.0.0.1.0.25.3"  # MT-ForwardSM (shortMsgMT-RelayContext-v3)
+ACN_SHORTMSG_GATEWAY_V3 = "0.4.0.0.1.0.20.3"                                       
+ACN_SHORTMSG_MO_RELAY_V3 = "0.4.0.0.1.0.21.3"                                             
+ACN_SHORTMSG_MT_RELAY_V3 = "0.4.0.0.1.0.25.3"                                             
 M3UA_MGMT_CLASS = 0
 M3UA_TRANSFER_CLASS = 1
 M3UA_SSNM_CLASS = 2
@@ -80,14 +77,11 @@ ASN1_CONTEXT_1 = 0x81
 ASN1_CONTEXT_2 = 0x82
 ASN1_INTEGER = 0x02
 ASN1_OCTET_STRING = 0x04
-
 class TimestampFormatter(logging.Formatter):
     def format(self, record):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         record.msg = f"{timestamp} {record.msg}"
         return super().format(record)
-
-
 class M3UAMessage:
     def __init__(self, version=1, msg_class=0, msg_type=0, length=8, data=b''):
         self.version = version
@@ -174,7 +168,7 @@ class MAPSIGTRANServer:
         self.active_transactions = {}
         self.log_level = log_level.upper()
         self.outgoing_dialogues = {}     
-        self.pending_mt = {}  # NEW: correlate SRI-SM -> MT-FSM        
+        self.pending_mt = {}                                           
         self.setup_logging()
         if self.log_level in ['INFO', 'DEBUG']:
             self.logger.info("=" * 60)
@@ -212,7 +206,292 @@ class MAPSIGTRANServer:
         self.logger.error(message)
     def log_debug(self, message):
         if self.log_level == 'DEBUG':
-            self.logger.debug(message)    
+            self.logger.debug(message)  
+    def _log_map_1line(self, direction: str, opc: int, dpc: int,
+                       calling_gt: str, called_gt: str,
+                       tcap_data: bytes, op_code=None):
+        tid = self._first_tid_for_log(tcap_data)
+        op_name = self._map_op_name(op_code)
+    
+        ack_suffix = ""
+        try:
+            comp_tag = self._get_component_tag(tcap_data)
+            if comp_tag == 0xA2:
+                ack_suffix = " returnResultLast"
+        except Exception:
+            comp_tag = -1
+    
+        sca_str = None
+        try:
+            # Keep existing behavior: SCA shown on Invoke lines
+            if comp_tag == 0xA1:
+                sca_str = self._extract_sc_address_for_log(tcap_data, op_code)
+        except Exception:
+            pass
+    
+        # If this TCAP has no recognizable MAP op, show TCAP primitive
+        if op_name == "-" and tcap_data and len(tcap_data) > 0:
+            tcap_tag = tcap_data[0]
+            tcap_type = {
+                0x62: "TCAP-BEGIN",
+                0x64: "TCAP-END",
+                0x65: "TCAP-CONTINUE",
+                0x67: "TCAP-ABORT"
+            }.get(tcap_tag, f"TCAP-0x{tcap_tag:02X}")
+            op_name = tcap_type
+    
+        # Try to enrich the line
+        extra = ""
+        try:
+            # Show PID/DCS/TXT preview for MO/MT SMS
+            if isinstance(op_code, int) and op_code in (MAP_MO_FSM, MAP_MT_FSM) and tcap_data:
+                pid, dcs, preview = self._extract_pid_dcs_preview(tcap_data, op_code, max_chars=10)
+                if pid is not None and dcs is not None and preview is not None:
+                    preview = preview.replace("\n", "\\n").replace("\r", "\\r")
+                    extra = f" PID=0x{pid:02X} DCS=0x{dcs:02X} TXT='{preview}'"
+    
+            # NEW: For SRI-SM ReturnResultLast, append IMSI and NNN (MSC GT) decoded from MAP PDU
+            elif isinstance(op_code, int) and op_code == MAP_SRI_SM and tcap_data and comp_tag == 0xA2:
+                imsi, nnn = self._parse_sri_sm_return(tcap_data)  # already implemented in your code
+                # Only append if we found something useful
+                if imsi or nnn:
+                    imsi_str = imsi if imsi else "-"
+                    nnn_str  = nnn  if nnn  else "-"
+                    extra = f" IMSI={imsi_str} NNN={nnn_str}"
+    
+        except Exception as e:
+            # Be quiet in INFO mode; DEBUG will have more traces if needed
+            self.log_debug(f"[LOG-ENRICH] error: {e}")
+    
+        line = (
+            f"{direction} "
+            f"{opc:<5} -> {dpc:<5} "
+            f"TID={self._format_tid(tid)} "
+            f"{calling_gt or '-'} -> {called_gt or '-'} "
+            f"SCA={sca_str or 'NA':<14} "
+            f"{op_name}{ack_suffix}{extra} "
+        )
+        self.log_info(line)
+    
+    def _extract_pid_dcs_preview(self, tcap_data: bytes, op_code: int, max_chars: int = 10):
+        """
+        Extract PID, DCS and a short human-readable text preview from a MAP SMS operation.
+        Changes:
+          1) Prefer parsing candidates as raw TPDU first (works when SM-RP-UI carries a bare TPDU).
+          2) Fallback to RPDU container parsing (SM-RP-UI contains RP-User-Data IE 0x04 with TPDU).
+          3) Fix SMS-SUBMIT VPF=0 handling (no 'continue'; proceed to UDL parsing).
+          4) Optional: slightly richer GSM 7-bit base mapping to reduce '?' in previews.
+        """
+        try:
+            comp = self._extract_component_portion(tcap_data)
+            if not comp:
+                return None, None, None
+    
+            top = self._read_tlv(comp, 0)
+            if not top:
+                return None, None, None
+            _, _, vs, ve, _ = top
+    
+            # Walk helper to collect OCTET STRING candidates (0x04) under the Invoke / ReturnResult trees
+            def walk(buf, start, end):
+                off = start
+                while off < end:
+                    node = self._read_tlv(buf, off)
+                    if not node:
+                        break
+                    tag, _, vstart, vend, off = node
+                    yield tag, vstart, vend
+                    if tag in (0x30, 0xA0, 0xA1, 0xA2, 0xA3, 0x6C, 0x60, 0x61, 0x6B, 0x28):
+                        for sub in walk(buf, vstart, vend):
+                            yield sub
+    
+            candidates = []
+            for tag, vstart, vend in walk(comp, vs, ve):
+                if tag == 0x04 and vend > vstart:
+                    candidates.append(comp[vstart:vend])
+    
+            # ---- Helpers --------------------------------------------------------
+    
+            def gsm7_unpack(data: bytes, septet_count: int, start_bit: int = 0):
+                """Minimal GSM 7-bit unpack with small base map to improve preview legibility."""
+                def get_septet(i: int):
+                    s = start_bit + i * 7
+                    bidx = s // 8
+                    boff = s % 8
+                    b0 = data[bidx] if bidx < len(data) else 0
+                    b1 = data[bidx + 1] if (bidx + 1) < len(data) else 0
+                    return ((b0 >> boff) | ((b1 << (8 - boff)) & 0xFF)) & 0x7F
+    
+                # Extension table (ESC 0x1B)
+                ext_map = {
+                    0x14: '^', 0x28: '{', 0x29: '}', 0x2F: '\\', 0x3C: '[', 0x3D: '~', 0x3E: ']', 0x40: '\n', 0x65: '€'
+                }
+                # Optional base glyphs for common control codes (improves previews vs '?')
+                base_map = {
+                    0x00: '@', 0x01: '£', 0x02: '$', 0x03: '¥', 0x04: 'è', 0x05: 'é', 0x06: 'ù', 0x07: 'ì',
+                    0x08: 'ò', 0x09: 'Ç', 0x0A: '\n', 0x0D: '\r', 0x10: 'Δ', 0x11: '_', 0x12: 'Φ', 0x13: 'Γ',
+                    0x14: 'Λ', 0x15: 'Ω', 0x16: 'Π', 0x17: 'Ψ', 0x18: 'Σ', 0x19: 'Θ', 0x1A: 'Ξ'
+                }
+    
+                out = []
+                i = 0
+                limit = max_chars
+                while i < septet_count and len(out) < limit:
+                    s = get_septet(i)
+                    i += 1
+                    if s == 0x1B and i < septet_count:
+                        e = get_septet(i)
+                        i += 1
+                        out.append(ext_map.get(e, '?'))
+                    else:
+                        if s in base_map:
+                            out.append(base_map[s])
+                        elif 0x20 <= s <= 0x7E:
+                            out.append(chr(s))
+                        else:
+                            out.append('?')
+                return ''.join(out)
+    
+            def parse_tpdu(tpdu: bytes, limit: int):
+                """Best-effort parse for SMS-DELIVER (MT, MTI=0) and SMS-SUBMIT (MO, MTI=1)."""
+                if not tpdu or len(tpdu) < 2:
+                    return None, None, None
+    
+                fo = tpdu[0]
+                mti = fo & 0x03
+                udhi = (fo & 0x40) != 0
+    
+                # --- SMS-DELIVER (MTI=0)
+                if mti == 0x00:
+                    idx = 1
+                    if idx >= len(tpdu):
+                        return None, None, None
+                    oa_len = tpdu[idx]; idx += 1
+                    idx += 1 + ((oa_len + 1) // 2)       # TOA + address digits
+                    if idx + 2 > len(tpdu):
+                        return None, None, None
+                    pid = tpdu[idx]; dcs = tpdu[idx + 1]; idx += 2
+                    if idx + 7 > len(tpdu):              # SCTS
+                        return pid, dcs, None
+                    idx += 7
+                    if idx >= len(tpdu):
+                        return pid, dcs, None
+                    udl = tpdu[idx]; idx += 1
+                    ud = tpdu[idx:]
+    
+                    if dcs == 0x08:  # UCS2
+                        start = 1 + ud[0] if (udhi and len(ud) >= 1) else 0
+                        text = ud[start:].decode('utf-16-be', errors='ignore')
+                        return pid, dcs, text[:limit]
+                    else:            # GSM 7-bit
+                        if not ud:
+                            return pid, dcs, ""
+                        if udhi and len(ud) >= 1:
+                            udhl = ud[0]
+                            header_octets = 1 + udhl
+                            if header_octets > len(ud):
+                                return pid, dcs, ""
+                            header_septets = ((header_octets * 8) + 6) // 7
+                            text_septets = max(0, udl - header_septets)
+                            pad_bits = (7 - ((header_octets * 8) % 7)) % 7
+                            data_bytes = ud[header_octets:]
+                            preview = gsm7_unpack(data_bytes, min(text_septets, limit), pad_bits)
+                            return pid, dcs, preview
+                        else:
+                            preview = gsm7_unpack(ud, min(udl, limit), 0)
+                            return pid, dcs, preview
+    
+                # --- SMS-SUBMIT (MTI=1)
+                elif mti == 0x01:
+                    idx = 2  # FO, MR
+                    if (idx - 1) >= len(tpdu):
+                        return None, None, None
+                    if idx >= len(tpdu):
+                        return None, None, None
+                    da_len = tpdu[idx]; idx += 1
+                    idx += 1 + ((da_len + 1) // 2)       # TOA + address digits
+                    if idx + 2 > len(tpdu):
+                        return None, None, None
+                    pid = tpdu[idx]; dcs = tpdu[idx + 1]; idx += 2
+    
+                    vpf = (fo >> 3) & 0x03
+                    if vpf == 0x02:                       # relative
+                        if idx >= len(tpdu):
+                            return pid, dcs, None
+                        idx += 1
+                    elif vpf == 0x03:                     # absolute/enhanced
+                        if idx + 7 > len(tpdu):
+                            return pid, dcs, None
+                        idx += 7
+                    else:
+                        # No VP field present (correct behavior: no-op)
+                        pass
+    
+                    if idx >= len(tpdu):
+                        return pid, dcs, None
+                    udl = tpdu[idx]; idx += 1
+                    ud = tpdu[idx:]
+    
+                    if dcs == 0x08:  # UCS2
+                        start = 1 + ud[0] if (udhi and len(ud) >= 1) else 0
+                        text = ud[start:].decode('utf-16-be', errors='ignore')
+                        return pid, dcs, text[:limit]
+                    else:            # GSM 7-bit
+                        if not ud:
+                            return pid, dcs, ""
+                        if udhi and len(ud) >= 1:
+                            udhl = ud[0]
+                            header_octets = 1 + udhl
+                            if header_octets > len(ud):
+                                return pid, dcs, ""
+                            header_septets = ((header_octets * 8) + 6) // 7
+                            text_septets = max(0, udl - header_septets)
+                            pad_bits = (7 - ((header_octets * 8) % 7)) % 7
+                            data_bytes = ud[header_octets:]
+                            preview = gsm7_unpack(data_bytes, min(text_septets, limit), pad_bits)
+                            return pid, dcs, preview
+                        else:
+                            preview = gsm7_unpack(ud, min(udl, limit), 0)
+                            return pid, dcs, preview
+    
+                # Unknown MTI
+                return None, None, None
+    
+            # ---- Try candidates -------------------------------------------------
+    
+            for blob in candidates:
+                # 1) First, try interpreting the OCTET STRING as a *raw TPDU*.
+                pid, dcs, prev = parse_tpdu(blob, max_chars)
+                if pid is not None and dcs is not None and prev is not None:
+                    # Normalize preview escapes for logging
+                    prev = prev.replace("\n", "\\n").replace("\r", "\\r")
+                    return pid, dcs, prev
+    
+                # 2) Fallback: treat the blob as an RPDU and extract inner TPDU from RP-User-Data (IEI=0x04)
+                if len(blob) >= 3 and (blob[0] & 0x3F) == 0x01:
+                    i = 2
+                    while i + 2 <= len(blob):
+                        iei = blob[i]; i += 1
+                        if i >= len(blob):
+                            break
+                        ielen = blob[i]; i += 1
+                        if i + ielen > len(blob):
+                            break
+                        ieval = blob[i:i + ielen]; i += ielen
+                        if iei == 0x04 and len(ieval) >= 1:  # RP-User-Data
+                            L = ieval[0]
+                            tpdu = ieval[1:1 + L] if 1 + L <= len(ieval) else ieval[1:]
+                            pid, dcs, prev = parse_tpdu(tpdu, max_chars)
+                            if pid is not None and dcs is not None and prev is not None:
+                                prev = prev.replace("\n", "\\n").replace("\r", "\\r")
+                                return pid, dcs, prev
+    
+            return None, None, None
+    
+        except Exception:
+            return None, None, None
+    
+
     def _first_tid_for_log(self, tcap_data: bytes) -> bytes:
         try:
             dtid = self.extract_dtid_from_tcap(tcap_data)
@@ -229,100 +508,109 @@ class MAPSIGTRANServer:
         if isinstance(op_code, tuple) and len(op_code) == 2 and op_code[0] == 'oid':
             return op_code[1] or "oid"
         return "-"    
- 
+    def _extract_sc_address_for_log(self, tcap_data: bytes, op_code) -> Optional[str]:
+            try:
+                comp = self._extract_component_portion(tcap_data)
+                if not comp:
+                    return None
+                tlv = self._read_tlv(comp, 0)
+                if not tlv or tlv[0] != 0x6C:
+                    return None
+                _, _, vs, ve, _ = tlv
+                inner = self._read_tlv(comp, vs)
+                if not inner or inner[0] != 0xA1:
+                    return None
+                _, _, ivs, ive, _ = inner
+                off = ivs
+                first = self._read_tlv(comp, off)
+                if not first:
+                    return None
+                if first[0] == 0x02:
+                    off = first[4]
+                    nxt = self._read_tlv(comp, off)
+                    if not nxt:
+                        return None
+                    off = nxt[4]
+                params = None
+                cur = off
+                while cur < ive:
+                    node = self._read_tlv(comp, cur)
+                    if not node:
+                        break
+                    if node[0] == 0x30:
+                        params = node
+                        break
+                    cur = node[4]
+                if not params:
+                    return None        
+                p_vs, p_ve = params[2], params[3]
+                prefer = 0x82 if op_code == MAP_SRI_SM else 0x84
+                def find_addr(buf, start, end, tag):
+                    off2 = start
+                    while off2 < end:
+                        n = self._read_tlv(buf, off2)
+                        if not n:
+                            break
+                        t, _, vstart, vend, off2 = n
+                        if t == tag:
+                            val = buf[vstart:vend]
+                            if len(val) >= 1:
+                                return self.decode_bcd_digits(val[1:])
+                    return None
+                sca = find_addr(comp, p_vs, p_ve, prefer)
+                if sca:
+                    return sca
+                other = 0x84 if prefer == 0x82 else 0x82
+                return find_addr(comp, p_vs, p_ve, other)
+            except Exception as e:
+                self.log_debug(f"SC-Address parse error: {e}")
+                return None
     def _guess_fragment_from_dialogue(self, tcap_data: bytes) -> Optional[str]:
-        """
-        Fallback for MO sends: if parsing SM-RP-UI/TPDU didn't yield a concat UDH,
-        derive "fragment X of Y" from our dialogue queues.
-    
-        Strategy:
-          1) Try to locate the MO dialogue by OTID/DTID and use dlg['next']/len(components).
-          2) Extract the exact Component Portion (0x6C ...), then match it against the
-             queued 'components' to find the index explicitly (works across re-opened BEGINs).
-    
-        Returns:
-            "fragment <seq> of <total>" or None if not applicable.
-        """
-        try:
-            # We need a component portion to reason about an MO-FSM invoke.
+        try:            
             comp = self._extract_component_portion(tcap_data)
             if not comp:
                 return None
-    
             otid = self.extract_otid_from_tcap(tcap_data)
             dtid = self.extract_dtid_from_tcap(tcap_data)
-    
-            # Consider all MO dialogues; we will prefer TID matches but also allow
-            # pure component matching for robustness across re-opened dialogues.
             for dlg in list(self.outgoing_dialogues.values()):
                 if dlg.get('flow') != 'MO':
                     continue
-    
                 comps = dlg.get('components', [])
                 total = len(comps)
                 if total <= 1:
-                    # No concatenation or not a segmented send from our side.
                     continue
-    
                 our = dlg.get('our_otid')
                 peer = dlg.get('peer_otid')
-    
-                # Heuristic: decide whether this dialogue is a TID match.
                 tid_match = False
                 if otid is not None and (otid == our or otid == peer):
                     tid_match = True
                 if dtid is not None and (dtid == our or dtid == peer):
                     tid_match = True
-    
-                # 1) First try the 'next' index if it points to the same component being sent now.
                 idx = int(dlg.get('next', 0))
                 if 0 <= idx < total:
                     try:
                         if comps[idx] == comp:
                             return f"fragment {idx + 1} of {total}"
                     except Exception:
-                        # Safe-guard: in case comps[idx] isn't bytes or raises on equality
                         pass
-    
-                # 2) If not, scan all components for an exact byte match.
-                #    This covers the re-open-as-BEGIN flow where we pre-enqueue components
-                #    and send one of them in the brand-new dialogue.
                 try:
                     for i, c in enumerate(comps):
                         if c == comp:
                             return f"fragment {i + 1} of {total}"
                 except Exception:
-                    # If equality check has issues, ignore and fall through.
                     pass
-    
-                # 3) If we have a TID match but couldn't byte-match the component
-                #    (e.g., logger fired before we updated 'components' or 'next'),
-                #    fall back to the 'next' index heuristically.
                 if tid_match and 0 <= idx < total:
                     return f"fragment {idx + 1} of {total}"
-    
             return None
-    
         except Exception as e:
             self.log_debug(f"[FRAG] guess-by-dialogue error: {e}")
             return None
-    
-     
     def _extract_fragment_info(self, tcap_data: bytes) -> Optional[str]:
-        """
-        Return 'fragment X of Y' if the first MAP Invoke's SM-RP-UI contains a TPDU
-        with a concatenation UDH (IEI 0x00 or 0x08). Works for:
-          - SM-RP-UI carrying RP-DATA (find RP-User IEI=0x04 -> TPDU),
-          - SM-RP-UI carrying raw TPDU (your MO path),
-          - SMS-DELIVER (MTI=0) and SMS-SUBMIT (MTI=1, with/without VP).
-        """
-        # Helper: iterate all OCTET STRING (0x04) leaves under first Invoke (0xA1)
         def iter_octet_strings_under_invoke(comp_bytes: bytes) -> List[bytes]:
             first = self._read_tlv(comp_bytes, 0)
             if not first or first[0] != 0xA1:
                 return []
             _, _, inv_vs, inv_ve, _ = first
-    
             def walk(buf: bytes, start: int, end: int):
                 off = start
                 while off < end:
@@ -331,21 +619,17 @@ class MAPSIGTRANServer:
                         break
                     tag, _, vstart, vend, off = node
                     yield tag, vstart, vend
-                    # recurse only into constructed tags
                     if tag in (0x30, 0xA0, 0xA1, 0xA2, 0xA3):
                         for sub in walk(buf, vstart, vend):
                             yield sub
-    
             blobs = []
             for tag, vstart, vend in walk(comp_bytes, inv_vs, inv_ve):
-                if tag == 0x04:  # OCTET STRING
+                if tag == 0x04:                
                     cand = comp_bytes[vstart:vend]
                     if len(cand) >= 3:
                         blobs.append(cand)
             return blobs
-    
         try:
-            # 1) Component Portion (0x6C)
             comp = self._extract_component_portion(tcap_data)
             if not comp:
                 return None
@@ -354,13 +638,9 @@ class MAPSIGTRANServer:
                 return None
             _, _, vs, ve, _ = tlv
             comp_bytes = comp[vs:ve]
-    
-            # 2) Try all candidate OCTET STRINGs under first Invoke
             for smrpui in iter_octet_strings_under_invoke(comp_bytes):
-                # 3) Extract TPDU from SM-RP-UI (RP-DATA or raw TPDU)
                 tpdu = None
                 if len(smrpui) >= 3 and (smrpui[0] & 0x3F) == 0x01:
-                    # RP-DATA: find RP-User IEI 0x04
                     i = 2
                     while i + 2 <= len(smrpui):
                         iei = smrpui[i]; i += 1
@@ -373,128 +653,63 @@ class MAPSIGTRANServer:
                             tpdu = ieval[1:1+L] if 1+L <= len(ieval) else ieval[1:]
                             break
                 else:
-                    # raw TPDU (MO path)
                     tpdu = smrpui
-    
                 if not tpdu or len(tpdu) < 2:
                     continue
-    
-                # 4) Parse TPDU header
                 fo = tpdu[0]
                 udhi = (fo & 0x40) != 0
                 if not udhi:
-                    # No UDH -> no fragmentation info in this candidate
                     continue
                 mti = fo & 0x03
                 idx = 0
-    
-                if mti == 0x00:  # SMS-DELIVER: FO|OA|PID|DCS|SCTS|UDL|UD
+                if mti == 0x00:                                          
                     idx = 1
                     if idx >= len(tpdu): continue
                     oa_len = tpdu[idx]; idx += 1
-                    idx += 1 + ((oa_len + 1)//2)  # TOA + BCD digits
-                    idx += 2  # PID + DCS
-                    idx += 7  # SCTS
-                elif mti == 0x01:  # SMS-SUBMIT: FO|MR|DA|PID|DCS|VP?|UDL|UD
-                    idx = 2  # skip MR
+                    idx += 1 + ((oa_len + 1)//2)                    
+                    idx += 2             
+                    idx += 7        
+                elif mti == 0x01:                                           
+                    idx = 2           
                     if idx >= len(tpdu): continue
                     da_len = tpdu[idx]; idx += 1
-                    idx += 1 + ((da_len + 1)//2)  # TOA + BCD digits
-                    idx += 2  # PID + DCS
+                    idx += 1 + ((da_len + 1)//2)                    
+                    idx += 2             
                     vpf = (fo >> 3) & 0x03
-                    if vpf == 0x02:   # relative VP
+                    if vpf == 0x02:                
                         idx += 1
-                    elif vpf == 0x03: # absolute/enhanced VP
+                    elif vpf == 0x03:                       
                         idx += 7
                 else:
-                    # other MTIs not relevant for SMS text
                     continue
-    
                 if idx >= len(tpdu):
                     continue
-                # UDL (we don't need the value; just step over it)
                 idx += 1
                 if idx > len(tpdu):
                     continue
                 ud = tpdu[idx:]
                 if len(ud) < 1:
                     continue
-    
-                # 5) UDH parsing at start of UD
                 udhl = ud[0]
                 if 1 + udhl > len(ud):
                     continue
                 udh = ud[1:1+udhl]
-    
                 p = 0
                 while p + 2 <= len(udh):
                     iei = udh[p]; p += 1
                     ielen = udh[p]; p += 1
                     if p + ielen > len(udh): break
                     ieval = udh[p:p+ielen]; p += ielen
-                    # 8-bit concatenation
                     if iei == 0x00 and ielen == 3:
                         total = ieval[1]; seq = ieval[2]
                         return f"fragment {seq} of {total}"
-                    # 16-bit concatenation
                     if iei == 0x08 and ielen == 4:
                         total = ieval[2]; seq = ieval[3]
                         return f"fragment {seq} of {total}"
-    
-            # Nothing found
             return None
-    
         except Exception as e:
             self.log_error(f"Fragment info extraction error: {e}")
             return None
-    
-    
-    
-    def _log_map_1line(self, direction: str, opc: int, dpc: int,
-                       calling_gt: str, called_gt: str,
-                       tcap_data: bytes, op_code=None):
-        tid = self._first_tid_for_log(tcap_data)
-        op_name = self._map_op_name(op_code)
-        ack_suffix = ""
-    
-        try:
-            comp_tag = self._get_component_tag(tcap_data)  # 0xA2 = ReturnResultLast
-            if comp_tag == 0xA2:
-                ack_suffix = " (ack)"
-        except Exception:
-            pass
-    
-        # If op_name is "-", try to show TCAP type
-        if op_name == "-" and tcap_data and len(tcap_data) > 0:
-            tcap_tag = tcap_data[0]
-            tcap_type = {
-                0x62: "TCAP-BEGIN",
-                0x64: "TCAP-END",
-                0x65: "TCAP-CONTINUE",
-                0x67: "TCAP-ABORT"
-            }.get(tcap_tag, f"TCAP-0x{tcap_tag:02X}")
-            op_name = tcap_type
-    
-        frag_info = self._extract_fragment_info(tcap_data)
-        
-        
-        if not frag_info and direction == "Send":
-          if op_code == MAP_MO_FSM or op_name.startswith("mo-forwardSM"):
-            hint = self._guess_fragment_from_dialogue(tcap_data)
-            if hint:
-                frag_info = hint
-
-
-
-        if frag_info:
-            self.log_debug(f"[FRAG] {frag_info}")
-            op_name += f" ({frag_info})"
-
-        line = (f"{direction} "
-                f"OPC={opc:<5} DPC={dpc:<5} "
-                f"TID={self._format_tid(tid)} CgPA={calling_gt or '-'} CdPA={called_gt or '-'}  {op_name:<20}{ack_suffix:<8} ")
-        self.log_info(line)
-        
     def create_socket(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, IPPROTO_SCTP)
@@ -516,7 +731,6 @@ class MAPSIGTRANServer:
     def _build_address_string(self, ton: int, npi: int, digits: str) -> bytes:
         toa = 0x80 | ((ton & 0x07) << 4) | (npi & 0x0F)
         return bytes([toa]) + self.encode_bcd_digits(''.join(ch for ch in digits if ch.isdigit()))
-
     def _bcd2(self, v: int) -> int:
         return ((v // 10) & 0x0F) | (((v % 10) & 0x0F) << 4)
     def _build_scts(self) -> bytes:        
@@ -528,26 +742,11 @@ class MAPSIGTRANServer:
             self._bcd2(t.tm_hour),
             self._bcd2(t.tm_min),
             self._bcd2(t.tm_sec),
-            0x00  # timezone 0
+            0x00              
         ])
-    def _pack_gsm7(self, s: str) -> bytes:       
-        septets = [ord(c) & 0x7F for c in s]
-        out = bytearray()
-        acc = 0; bits = 0
-        for sp in septets:
-            acc |= (sp << bits)
-            bits += 7
-            while bits >= 8:
-                out.append(acc & 0xFF)
-                acc >>= 8
-                bits -= 8
-        if bits:
-            out.append(acc & 0xFF)
-        return bytes(out)
     def _build_tpdu_sms_deliver(self, oa_ton: int, oa_npi: int, oa_digits: str, text: str) -> bytes:       
-        fo = 0x00  # MTI=00 (DELIVER), UDHI=0
+        fo = 0x00                            
         fo |= 0x04
-        # OA
         oa_digits_sanitized = ''.join(ch for ch in oa_digits if ch.isdigit())
         oa_len_digits = len(oa_digits_sanitized)
         oa_toa = 0x80 | ((oa_ton & 0x07) << 4) | (oa_npi & 0x0F)
@@ -557,13 +756,13 @@ class MAPSIGTRANServer:
         if any(ord(ch) > 0x7F for ch in text):
             dcs = 0x08
             ud = text.encode('utf-16-be')
-            if len(ud) > 140:  # truncate to one RPDU
+            if len(ud) > 140:                        
                 ud = ud[:140]
             udl = len(ud)
         else:
             dcs = 0x00
             ud = self._gsm7_pack_text(text)
-            udl = self._gsm7_septet_len_exact(text)  # septets, not octets
+            udl = self._gsm7_septet_len_exact(text)                       
         scts = self._build_scts()
         return bytes([fo]) + oa + bytes([pid, dcs]) + scts + bytes([udl]) + ud
     def _build_sri_sm_component(self, msisdn_addr: str,
@@ -573,31 +772,22 @@ class MAPSIGTRANServer:
         msisdn_as = self._build_address_string(ton_msisdn, npi_msisdn, msisdn_digits)
         p_msisdn = self.encode_asn1_tag_length(0x80, msisdn_as)  
         if pri is None:
-            # allow config override, otherwise TRUE
             pri = bool(int(CONFIG.get('sri_sm_priority', 1)))
-        p_pri = self.encode_asn1_tag_length(0x81, b'\xff' if pri else b'\x00')  # [1] BOOLEAN
-
-        # --- [2] serviceCentreAddress (AddressString) ---
+        p_pri = self.encode_asn1_tag_length(0x81, b'\xff' if pri else b'\x00')               
         if not sc_addr:
             sc_addr = CONFIG.get('fsmsc_gt') 
         if not sc_addr:
             raise ValueError("SRI-SM: No serviceCentreAddress (fsmsc_gt missing).")
         ton_sc, npi_sc, sc_digits = self._parse_ton_npi_digits(sc_addr)
         sc_as = self._build_address_string(ton_sc, npi_sc, sc_digits)
-        p_sca = self.encode_asn1_tag_length(0x82, sc_as)  # [2] AddressString
-
-        # Pack parameters into a SEQUENCE
+        p_sca = self.encode_asn1_tag_length(0x82, sc_as)                     
         params = self.encode_asn1_tag_length(0x30, p_msisdn + p_pri + p_sca)
-
-        # Invoke (local opCode = 45 for sendRoutingInfoForSM)
         invoke_id = self.encode_asn1_tag_length(0x02, bytes([random.randint(1, 127)]))
         opcode_local = self.encode_asn1_tag_length(0x02, bytes([45]))
         invoke = self.encode_asn1_tag_length(0xA1, invoke_id + opcode_local + params)
         return self.encode_asn1_tag_length(0x6C, invoke)
-    def send_sri_sm(self, msisdn_addr: str, originator: str, text: str) -> bool:
-        
+    def send_sri_sm(self, msisdn_addr: str, originator: str, text: str) -> bool:        
         try:
-           
             component = self._build_sri_sm_component(
                 msisdn_addr,
                 pri=bool(int(CONFIG.get('sri_sm_priority', 1))),
@@ -611,7 +801,6 @@ class MAPSIGTRANServer:
                 self.log_error("SRI-SM: missing called_gt/calling_gt")
                 return False
             key = our_otid.hex()
-           
             self.pending_mt[key] = {
                 'originator': originator,
                 'msisdn_addr': msisdn_addr,
@@ -628,7 +817,6 @@ class MAPSIGTRANServer:
         except Exception as e:
             self.log_error(f"SRI-SM send error: {e}")
             return False
-# ---------- SRI-SM ReturnResult parsing + chaining to MT-FSM (NEW) ----------
     def _get_component_tag(self, tcap_data: bytes) -> int:
         """Return first component tag inside Component Portion (0x6C), e.g. 0xA1 invoke or 0xA2 returnResultLast."""
         tlv = self._read_tlv(tcap_data, 0)
@@ -643,7 +831,6 @@ class MAPSIGTRANServer:
                 inner = self._read_tlv(tcap_data, nvs)
                 return inner[0] if inner else -1
         return -1
-
     def _read_tlv(self, buf: bytes, off: int):
         if off >= len(buf): return None
         tag = buf[off]; off += 1
@@ -658,13 +845,11 @@ class MAPSIGTRANServer:
         end = off + length
         if end > len(buf): return None
         return (tag, length, off, end, end)
-
     def _parse_sri_sm_return(self, tcap_data: bytes):
         """
         Return (imsi_str, nnn_digits) if found in ReturnResultLast parameters.
         """
         try:
-            # Find Component Portion -> ReturnResultLast -> result seq -> parameter seq
             top = self._read_tlv(tcap_data, 0)
             if not top: return None, None
             _, _, tcap_vs, tcap_ve, _ = top
@@ -679,28 +864,23 @@ class MAPSIGTRANServer:
             if not comp_slice: return None, None
             cvs, cve = comp_slice
             comp = self._read_tlv(tcap_data, cvs)
-            if not comp or comp[0] != 0xA2:  # ReturnResultLast
+            if not comp or comp[0] != 0xA2:                    
                 return None, None
-            # Skip invokeId (INTEGER) if present; then expect result SEQUENCE (0x30)
             inner_off = comp[2]
             first = self._read_tlv(tcap_data, inner_off)
             if not first: return None, None
-            if first[0] == 0x02:  # invokeId
+            if first[0] == 0x02:            
                 inner_off = first[4]
             result = self._read_tlv(tcap_data, inner_off)
             if not result or result[0] != 0x30: return None, None
-            # result ::= SEQUENCE { opCode, parameter  }
             r_vs, r_ve = result[2], result[3]
             scan = r_vs
-            # opCode
             op = self._read_tlv(tcap_data, scan)
             if not op: return None, None
             scan = op[4]
-            # parameter (0x30)
             prm = self._read_tlv(tcap_data, scan)
             if not prm or prm[0] != 0x30: return None, None
             p_vs, p_ve = prm[2], prm[3]
-            # Expect IMSI (OCTET STRING 0x04) + locationInfoWithSM-RP-MTI [0] (0xA0 { [1] addressString })
             imsi_str = None
             nnn_digits = None
             p_off = p_vs
@@ -711,13 +891,11 @@ class MAPSIGTRANServer:
                 if tag == 0x04 and imsi_str is None:
                     imsi_str = self.decode_bcd_digits(tcap_data[vs:ve])
                 elif tag == 0xA0 and nnn_digits is None:
-                    # inside may contain 0x81 (addressString)
                     inner = self._read_tlv(tcap_data, vs)
                     if inner and inner[0] in (0x81, 0x80):
                         avs, ave = inner[2], inner[3]
                         val = tcap_data[avs:ave]
                         if len(val) >= 1:
-                            # AddressString: TOA + BCD
                             if val[0] in (0x91, 0x81, 0xA1) and len(val) >= 2:
                                 nnn_digits = self.decode_bcd_digits(val[1:])
                             else:
@@ -726,15 +904,7 @@ class MAPSIGTRANServer:
         except Exception as e:
             self.log_error(f"Parse SRI-SM ReturnResult error: {e}")
             return None, None
-
-
     def _on_sri_sm_result(self, tcap_data: bytes):
-        """
-        Handle SRI-SM ReturnResult and trigger MT-FSM.
-        - If the message is short: send a single MT-FSM in a TCAP BEGIN (ACN 25.3).
-        - If the message is long: open a dialogue first (AARQ-only BEGIN), then send
-          segmented MT-FSM invokes on TCAP CONTINUE with proper UDHI/UDH.
-        """
         try:
             dtid = self.extract_dtid_from_tcap(tcap_data)
             if not dtid:
@@ -743,10 +913,7 @@ class MAPSIGTRANServer:
             key = dtid.hex()
             ctx = self.pending_mt.get(key)
             if not ctx:
-                # Not our dialogue; ignore gracefully.
                 return
-
-            # Parse IMSI and NNN (MSC/VLR GT) from ReturnResult
             imsi, nnn = self._parse_sri_sm_return(tcap_data)
             if not imsi or not nnn:
                 self.log_error("SRI-SM RR: IMSI/NNN not found; aborting MT-FSM.")
@@ -755,9 +922,7 @@ class MAPSIGTRANServer:
                 except Exception:
                     pass
                 return
-
             self.log_debug(f"SRI-SM RR parsed -> IMSI={imsi}, NNN={nnn} (our_otid={key})")
-
             text = ctx.get('text', '')
             sc_addr = ctx.get('sc_addr') or CONFIG.get('fsmsc_gt')
             if not sc_addr:
@@ -767,21 +932,15 @@ class MAPSIGTRANServer:
                 except Exception:
                     pass
                 return
-
-            # Determine if long message (requires concatenation + UDHI)
             ucs2 = self._is_ucs2_text(text)
             long_gsm7 = (not ucs2) and (self._gsm7_septet_len_exact(text) > 160)
             long_ucs2 = ucs2 and (len(text) > 70)
             is_long = long_gsm7 or long_ucs2
-
-            # Parse addresses
             oa_ton, oa_npi, oa_digits = self._parse_ton_npi_digits(ctx.get('originator', '1.1'))
             smsc_ton, smsc_npi, smsc_digits = self._parse_ton_npi_digits(sc_addr)
-
-            # Helper: build one SMS-DELIVER TPDU with UDHI=1 and provided UDH
             def _build_tpdu_sms_deliver_segment(oa_t: int, oa_n: int, oa_d: str,
                                                 seg_text: str, enc: str, udh: bytes) -> bytes:
-                FO = 0x00 | 0x40  # MTI=00 (DELIVER), UDHI=1
+                FO = 0x00 | 0x40                            
                 digits = ''.join(ch for ch in oa_d if ch.isdigit())
                 oa_len_digits = len(digits)
                 TOA = 0x80 | ((oa_t & 0x07) << 4) | (oa_n & 0x0F)
@@ -791,39 +950,33 @@ class MAPSIGTRANServer:
                 if enc == 'ucs2':
                     DCS = 0x08
                     UD = bytes([len(udh)]) + udh + seg_text.encode('utf-16-be')
-                    UDL = len(UD)  # octets
+                    UDL = len(UD)          
                     return bytes([FO]) + OA + bytes([PID, DCS]) + SCTS + bytes([UDL]) + UD
                 else:
                     DCS = 0x00
                     UD, UDL_septets = self._gsm7_pack_with_udh(udh, seg_text)
                     return bytes([FO]) + OA + bytes([PID, DCS]) + SCTS + bytes([UDL_septets]) + UD
-
-            # Helper: wrap TPDU into one MT-FSM invoke component
             def _mt_component_from_tpdu(imsi_digits: str,
                                         sc_t: int, sc_n: int, sc_d: str,
                                         tpdu: bytes) -> bytes:
-                sm_rp_da = self.encode_asn1_tag_length(0x80, self.encode_bcd_digits(imsi_digits))  # [0] IMSI
-                sm_rp_oa = self.encode_asn1_tag_length(0x84, self._build_address_string(sc_t, sc_n, sc_d))  # SC addr
-                sm_rp_ui = self.encode_asn1_tag_length(0x04, tpdu)  # TPDU in SM-RP-UI
+                sm_rp_da = self.encode_asn1_tag_length(0x80, self.encode_bcd_digits(imsi_digits))            
+                sm_rp_oa = self.encode_asn1_tag_length(0x84, self._build_address_string(sc_t, sc_n, sc_d))           
+                sm_rp_ui = self.encode_asn1_tag_length(0x04, tpdu)                    
                 param_seq = self.encode_asn1_tag_length(0x30, sm_rp_da + sm_rp_oa + sm_rp_ui)
                 invoke_id_enc = self.encode_asn1_tag_length(0x02, bytes([random.randint(1, 127)]))
-                opcode_local = self.encode_asn1_tag_length(0x02, bytes([44]))  # MT-FSM
+                opcode_local = self.encode_asn1_tag_length(0x02, bytes([44]))          
                 invoke = self.encode_asn1_tag_length(0xA1, invoke_id_enc + opcode_local + param_seq)
                 return self.encode_asn1_tag_length(0x6C, invoke)
-
             if not is_long:
-                # --- Short message path: single MT-FSM in one BEGIN ---
-                tpdu = self._build_tpdu_sms_deliver(oa_ton, oa_npi, oa_digits, text)  # UDHI=0, no UDH
-                sm_rp_da = self.encode_asn1_tag_length(0x80, self.encode_bcd_digits(imsi))  # [0] IMSI
+                tpdu = self._build_tpdu_sms_deliver(oa_ton, oa_npi, oa_digits, text)                  
+                sm_rp_da = self.encode_asn1_tag_length(0x80, self.encode_bcd_digits(imsi))            
                 sm_rp_oa = self.encode_asn1_tag_length(0x84, self._build_address_string(smsc_ton, smsc_npi, smsc_digits))
-                sm_rp_ui = self.encode_asn1_tag_length(0x04, tpdu)  # TPDU in SM-RP-UI
+                sm_rp_ui = self.encode_asn1_tag_length(0x04, tpdu)                    
                 param_seq = self.encode_asn1_tag_length(0x30, sm_rp_da + sm_rp_oa + sm_rp_ui)
                 invoke_id = self.encode_asn1_tag_length(0x02, bytes([random.randint(1, 127)]))
                 opcode_mt = self.encode_asn1_tag_length(0x02, bytes([44]))
                 invoke = self.encode_asn1_tag_length(0xA1, invoke_id + opcode_mt + param_seq)
                 component_portion = self.encode_asn1_tag_length(0x6C, invoke)
-
-                # Wrap in TCAP BEGIN (MT ACN 0.4.0.0.1.0.25.3)
                 tcap_begin, _ = self._tcap_begin_with_component(component_portion, "0.4.0.0.1.0.25.3")
                 called_gt = nnn
                 calling_gt = sc_addr
@@ -832,20 +985,15 @@ class MAPSIGTRANServer:
                     self.log_debug(f"MT-FSM BEGIN (single) sent to NNN={called_gt} (IMSI={imsi})")
                 else:
                     self.log_error("Failed to send MT-FSM BEGIN (single).")
-
                 try:
                     del self.pending_mt[key]
                 except Exception:
                     pass
                 return
-
-            # --- Long message path: split -> queue components -> AARQ-only BEGIN ---
             def _split_text_for_mt(msg: str):
-                # UCS2: 67 UCS2 chars per segment (with UDH)
                 if any(ord(ch) > 0x7F for ch in msg):
                     per = 67
                     return [{'enc': 'ucs2', 'text': msg[i:i + per]} for i in range(0, len(msg), per)]
-                # GSM 7-bit with UDH: 153 septets budget
                 res = []
                 i = 0
                 ext = set('^{}\\[]~\n€')
@@ -861,26 +1009,21 @@ class MAPSIGTRANServer:
                     res.append({'enc': 'gsm7', 'text': msg[i:j]})
                     i = j
                 return res
-
             segments = _split_text_for_mt(text)
             total = len(segments)
             ref = random.randint(0, 255)
             components = []
-
             for idx, seg in enumerate(segments, start=1):
-                udh = self._make_concat_udh_8bit(ref, total, idx)  # IEI=00, LEN=03, ref, total, seq
+                udh = self._make_concat_udh_8bit(ref, total, idx)                                   
                 tpdu_seg = _build_tpdu_sms_deliver_segment(
                     oa_ton, oa_npi, oa_digits,
                     seg['text'], seg['enc'], udh
                 )
                 comp = _mt_component_from_tpdu(imsi, smsc_ton, smsc_npi, smsc_digits, tpdu_seg)
                 components.append(comp)
-
-            # Send AARQ-only BEGIN for MT ACN; actual MT-FSM components go on CONTINUE
             begin, our_otid = self.create_tcap_begin_dialogue_only("0.4.0.0.1.0.25.3")
-            called_gt = nnn                 # MSC/VLR NNN from SRI-SM
-            calling_gt = sc_addr            # SMSC address
-
+            called_gt = nnn                                          
+            calling_gt = sc_addr                          
             dlg_key = our_otid.hex()
             self.outgoing_dialogues[dlg_key] = {
                 'our_otid': our_otid,
@@ -891,36 +1034,20 @@ class MAPSIGTRANServer:
                 'next': 0,
                 'flow': 'MT',
                 'acn': ACN_SHORTMSG_MT_RELAY_V3,
-
             }
-
             ok = self._send_sccp_tcap_on_active(begin, called_gt, calling_gt)
             if ok:
                 self.log_debug(f"MT handshake: Sent TCAP BEGIN (AARQ-only). Waiting for CONTINUE... (our_otid={dlg_key})")
             else:
                 self.log_error("MT handshake: failed to send TCAP BEGIN (AARQ-only).")
-
-            # Clean up the pending SRI->MT context after we kick off the dialogue
             try:
                 del self.pending_mt[key]
             except Exception:
                 pass
-
         except Exception as e:
             self.log_error(f"SRI-SM RR handler error: {e}")
-
- 
-
     def _is_ucs2_text(self, s: str) -> bool:
         return any(ord(ch) > 0x7F for ch in s)
-    def _gsm7_septet_len_simple(self, s: str) -> int:
-        return len(s)
-    def _truncate_to_single_segment(self, text: str) -> str:
-        if self._is_ucs2_text(text):
-            return text[:70]                               
-        if self._gsm7_septet_len_simple(text) > 160:
-            return text[:160]
-        return text
     def create_tcap_begin_dialogue_only(self, acn_oid: str = "0.4.0.0.1.0.21.3"):
         our_otid = struct.pack("!I", random.randint(0x10000000, 0xFFFFFFFF))
         otid = self.encode_asn1_tag_length(0x48, our_otid)
@@ -933,8 +1060,6 @@ class MAPSIGTRANServer:
         dialogue_portion = self.encode_asn1_tag_length(0x6B, external)
         begin = self.encode_asn1_tag_length(0x62, otid + dialogue_portion)
         return begin, our_otid
-    def _gsm7_is_ext(ch: str) -> bool:
-        return ch in '^{}\\[~]|€'
     def _gsm7_septet_len_exact(self, s: str) -> int:
         ext = set('^{}\\[]~]|€')
         length = 0
@@ -965,16 +1090,13 @@ class MAPSIGTRANServer:
             else:
                 septets.append(ord(ch) & 0x7F)
         return self._gsm7_pack_septets(septets)
-
     def _gsm7_pack_with_udh(self, udh: bytes, text: str) -> Tuple[bytes, int]:
         udhl = len(udh)
-        header = bytes([udhl]) + udh  # UDHL + UDH (octets)
+        header = bytes([udhl]) + udh                       
         text_packed = self._gsm7_pack_text(text)
         text_septets = self._gsm7_septet_len_exact(text)
-    
         header_octets = len(header)
         pad_bits = (7 - ((header_octets * 8) % 7)) % 7
-    
         if pad_bits == 0:
             shifted = text_packed
         else:
@@ -984,24 +1106,16 @@ class MAPSIGTRANServer:
                 out_byte = ((b << pad_bits) & 0xFF) | carry
                 shifted_ba.append(out_byte)
                 carry = (b >> (8 - pad_bits)) & ((1 << pad_bits) - 1)
-            # IMPORTANT: append the last carry byte even if it is 0x00
             if text_septets > 0:
                 shifted_ba.append(carry)
             shifted = bytes(shifted_ba)
-    
-        # septet count used in UDL
-        header_septets = ((header_octets * 8) + 6) // 7  # == ceil(bits/7)
+        header_septets = ((header_octets * 8) + 6) // 7                   
         udl_septets = header_septets + text_septets
-    
-        # enforce octet length implied by UDL
-        expected_ud_octets = (udl_septets * 7 + 7) // 8  # ceil(UDL*7/8)
+        expected_ud_octets = (udl_septets * 7 + 7) // 8                 
         ud_bytes = header + shifted
         if len(ud_bytes) < expected_ud_octets:
             ud_bytes += b'\x00' * (expected_ud_octets - len(ud_bytes))
-    
         return ud_bytes, udl_septets
-    
-  
     def _extract_component_portion(self, tcap_data: bytes) -> Optional[bytes]:
         def _read_tlv(buf, off):
             if off >= len(buf): return None
@@ -1035,7 +1149,6 @@ class MAPSIGTRANServer:
                     header += bytes([0x6C, 0x80 | len(lb)]) + lb
                 return bytes(header) + value
         return None
-        
     def _on_dialogue_end_progress(self, tcap_data: bytes):
         try:
             dtid = self.extract_dtid_from_tcap(tcap_data)
@@ -1045,7 +1158,6 @@ class MAPSIGTRANServer:
             dlg = self.outgoing_dialogues.get(key)
             if not dlg:
                 return
-
             if 'components' not in dlg:
                 single = dlg.get('component')
                 if single:
@@ -1055,11 +1167,9 @@ class MAPSIGTRANServer:
                     del dlg['component']
                 except Exception:
                     pass
-
             comps = dlg.get('components', [])
             idx = int(dlg.get('next', 0))
             total = len(comps)
-
             if idx >= total:
                 try:
                     del self.outgoing_dialogues[key]
@@ -1067,20 +1177,14 @@ class MAPSIGTRANServer:
                     pass
                 self.log_debug("Handshake: peer TC-END received; queue already empty.")
                 return
-
             component = comps[idx]
             called_gt = dlg.get('called_gt')
             calling_gt = dlg.get('calling_gt')
-
-            # Prefer stored flow/acn (if present), else infer from the component
             flow = dlg.get('flow'); acn = dlg.get('acn')
             if not acn:
                 flow, acn = self._infer_map_context_from_component(component)
-
-            #self._debug_dump_mo_fsm_component(component, f"{flow} Reopen-Begin seg {idx + 1}/{total}")
             begin, new_otid = self._tcap_begin_with_component(component, acn)
             ok = self._send_sccp_tcap_on_active(begin, called_gt, calling_gt)
-
             if ok:
                 new_key = new_otid.hex()
                 new_state = {
@@ -1090,7 +1194,6 @@ class MAPSIGTRANServer:
                     'calling_gt': calling_gt,
                     'components': comps,
                     'next': idx + 1,
-                    # keep flow/acn if known
                     'flow': flow,
                     'acn': acn,
                 }
@@ -1108,9 +1211,6 @@ class MAPSIGTRANServer:
                 self.log_error(f"{flow} handshake: Failed to send new BEGIN for next segment after peer TC-END.")
         except Exception as e:
             self.log_error(f"Handshake (_on_dialogue_end_progress) error: {e}")
-
-            
-            
     def _tcap_begin_with_component(self, component: bytes, acn_oid: str = "0.4.0.0.1.0.21.3") -> Tuple[bytes, bytes]:
         our_otid = struct.pack("!I", random.randint(0x10000000, 0xFFFFFFFF))
         otid = self.encode_asn1_tag_length(0x48, our_otid)
@@ -1147,151 +1247,6 @@ class MAPSIGTRANServer:
             return None
         next_off = val_end
         return (tag, length, val_start, val_end, next_off)
-    def _inspect_tpdu(self, tpdu: bytes, context: str):
-        try:
-            if not tpdu or len(tpdu) < 2:
-                self.log_error(f"[TPDU/{context}] too short: {len(tpdu)}")
-                return
-            fo = tpdu[0]
-            mti = fo & 0x03
-            udhi = (fo & 0x40) != 0
-            mr = tpdu[1]
-            idx = 2
-            if idx >= len(tpdu):
-                self.log_error(f"[TPDU/{context}] truncated before DA length.")
-                return
-            da_len_digits = tpdu[idx]; idx += 1
-            if idx >= len(tpdu):
-                self.log_error(f"[TPDU/{context}] truncated before TOA.")
-                return
-            toa = tpdu[idx]; idx += 1
-            da_octets = (da_len_digits + 1) // 2
-            if idx + da_octets > len(tpdu):
-                self.log_error(f"[TPDU/{context}] DA digits truncated: need {da_octets}, have {len(tpdu) - idx}")
-                return
-            da_tbcd = tpdu[idx:idx + da_octets]
-            idx += da_octets
-            if idx + 2 > len(tpdu):
-                self.log_error(f"[TPDU/{context}] missing PID/DCS.")
-                return
-            pid = tpdu[idx]; dcs = tpdu[idx + 1]; idx += 2
-            if idx >= len(tpdu):
-                self.log_error(f"[TPDU/{context}] missing UDL.")
-                return
-            udl = tpdu[idx]; idx += 1
-            self.log_debug(f"[TPDU/{context}] FO=0x{fo:02X} (MTI={mti}, UDHI={'1' if udhi else '0'}) MR={mr} "
-                          f"DA_len(digits)={da_len_digits} TOA=0x{toa:02X} PID=0x{pid:02X} DCS=0x{dcs:02X} UDL={udl}")
-            if idx >= len(tpdu):
-                self.log_error(f"[TPDU/{context}] no UD bytes present.")
-                return
-            ud = tpdu[idx:]
-            if not udhi:
-                self.log_debug(f"[TPDU/{context}] UDHI=0; UD len={len(ud)} octets (no UDH).")
-                return
-            if len(ud) < 1:
-                self.log_error(f"[TPDU/{context}] UD too short for UDHL.")
-                return
-            udhl = ud[0]
-            if 1 + udhl > len(ud):
-                self.log_error(f"[TPDU/{context}] UDH truncated: UDHL={udhl}, available={len(ud)-1}")
-                return
-            udh = ud[1:1 + udhl]
-            user_data = ud[1 + udhl:]
-            self.log_debug(f"[TPDU/{context}] UD len={len(ud)} octets; UDHL={udhl}; UDH={udh.hex()} "
-                          f"user_data_octets={len(user_data)}")
-            p = 0
-            total = seq = None
-            while p + 2 <= len(udh):
-                iei = udh[p]; p += 1
-                ielen = udh[p]; p += 1
-                if p + ielen > len(udh):
-                    break
-                ieval = udh[p:p + ielen]; p += ielen
-                if iei == 0x00 and ielen == 3:
-                    total = ieval[1]; seq = ieval[2]
-                    break
-                elif iei == 0x08 and ielen == 4:
-                    total = ieval[2]; seq = ieval[3]
-                    break
-            if total is not None and seq is not None:
-                self.log_debug(f"[TPDU/{context}] Concat IE: parts={total} part={seq}")
-            else:
-                self.log_debug(f"[TPDU/{context}] Concat IE: not found")
-            if dcs == 0x00:
-                header_octets = 1 + udhl
-                pad_bits = (7 - ((header_octets * 8) % 7)) % 7
-        except Exception as e:
-            self.log_error(f"[TPDU/{context}] inspector error: {e}")
-    def _debug_dump_mo_fsm_component(self, component_portion: bytes, context: str):
-        try:
-            off = 0
-            tlv = self._read_tlv(component_portion, off)
-            if not tlv:
-                self.log_error(f"[MO-COMP/{context}] cannot read top TLV")
-                return
-            tag, length, vs, ve, off = tlv
-            if tag != 0x6C:                
-                vs = 0; ve = len(component_portion)
-            comp_bytes = component_portion[vs:ve]
-            inner = self._read_tlv(comp_bytes, 0)
-            if not inner:
-                self.log_error(f"[MO-COMP/{context}] cannot read inner component")
-                return
-            ctag, clen, cvs, cve, _ = inner
-            if ctag != 0xA1:
-                self.log_debug(f"[MO-COMP/{context}] first component not Invoke (tag=0x{ctag:02X})")
-            off2 = cvs
-            first = self._read_tlv(comp_bytes, off2)
-            invoke_id = None
-            if first and first[0] == 0x02:
-                _, _, fvs, fve, off2 = first
-                try:
-                    invoke_id = int.from_bytes(comp_bytes[fvs:fve], "big")
-                except Exception:
-                    invoke_id = None
-            smrpui = None
-            while off2 < cve:
-                node = self._read_tlv(comp_bytes, off2)
-                if not node:
-                    break
-                nt, nl, nvs, nve, off2 = node
-                if nt in (0x30, 0xA0, 0xA1, 0xA2, 0xA3):
-                    scan = nvs
-                    while scan < nve:
-                        leaf = self._read_tlv(comp_bytes, scan)
-                        if not leaf:
-                            break
-                        lt, ll, lvs, lve, scan = leaf
-                        if lt == 0x04:                           
-                            smrpui = comp_bytes[lvs:lve]
-                            break
-                if smrpui is not None:
-                    break
-            if smrpui is None:
-                self.log_error(f"[MO-COMP/{context}] sm-RP-UI not found")
-                return
-            looks_rpdu = (len(smrpui) >= 1 and (smrpui[0] & 0x3F) == 0x01)                            
-            head = smrpui[:32].hex()
-            if looks_rpdu:
-                i = 2                      
-                while i + 2 <= len(smrpui):
-                    iei = smrpui[i]; i += 1
-                    if i >= len(smrpui): break
-                    iel = smrpui[i]; i += 1
-                    if i + iel > len(smrpui): break
-                    iev = smrpui[i:i + iel]; i += iel
-                    if iei == 0x04 and len(iev) >= 1:
-                        tpdu_len = iev[0]
-                        if 1 + tpdu_len <= len(iev):
-                            tpdu = iev[1:1 + tpdu_len]
-                        else:
-                            tpdu = iev[1:]
-                        self._inspect_tpdu(tpdu, context + "/RPDU.TPDU")
-                        break
-            else:
-                self._inspect_tpdu(smrpui, context + "/TPDU")
-        except Exception as e:
-            self.log_error(f"[MO-COMP/{context}] error: {e}")
     def _on_dialogue_continue(self, tcap_data: bytes):
         dtid = self.extract_dtid_from_tcap(tcap_data)
         otid = self.extract_otid_from_tcap(tcap_data)
@@ -2111,135 +2066,6 @@ class MAPSIGTRANServer:
         except Exception as e:
             self.log_error(f"Error creating M3UA DATA message: {e}")
             return None
-    def parse_and_log_response(self, response_data, msg_type):
-        try:
-            if len(response_data) < 8:
-                self.log_error("MTP 3 User Adaptation Layer")
-                self.log_error("    [Error: Message too short for M3UA header]")
-                return
-            version, reserved, msg_class, msg_type_val, msg_length = struct.unpack('!BBBBI', response_data[:8])
-            msg_class_name = {
-                M3UA_TRANSFER_CLASS: 'Transfer messages',
-                M3UA_ASPSM_CLASS: 'ASP State Maintenance messages',
-                M3UA_ASPTM_CLASS: 'ASP Traffic Maintenance messages',
-                M3UA_MGMT_CLASS: 'Management messages'
-            }.get(msg_class, f'Unknown ({msg_class})')
-            msg_type_name = {
-                M3UA_DATA: 'Payload data (DATA)',
-                M3UA_ASPUP: 'ASP Up',
-                M3UA_ASPUP_ACK: 'ASP Up Ack',
-                M3UA_ASPAC: 'ASP Active',
-                M3UA_ASPAC_ACK: 'ASP Active Ack'
-            }.get(msg_type_val, f'Unknown ({msg_type_val})')
-            offset = 8
-            param_num = 1
-            while offset < len(response_data):
-                if offset + 4 > len(response_data):
-                    self.log_error("    [Error: Incomplete parameter at offset {offset}]")
-                    break
-                tag, length = struct.unpack('!HH', response_data[offset:offset+4])
-                param_data = response_data[offset+4:offset+length] if length > 4 else b''
-                param_name = self.get_m3ua_param_name(tag)
-                if tag == M3UA_PARAM_ROUTING_CONTEXT:
-                    if len(param_data) >= 4:
-                        rc_value = struct.unpack('!I', param_data[:4])[0]
-                elif tag == M3UA_PARAM_PROTOCOL_DATA:
-                    self.parse_protocol_data_response(param_data)
-                padded_length = (length + 3) & ~3
-                offset += padded_length
-                param_num += 1
-        except Exception as e:
-            self.log_error(f"Error parsing {msg_type}: {e}")
-    def parse_protocol_data_response(self, protocol_data):
-        try:
-            if len(protocol_data) < 12:
-                self.log_error("    Protocol data")
-                self.log_error("        [Error: Protocol Data too short]")
-                return
-            opc = struct.unpack('!I', protocol_data[0:4])[0]
-            dpc = struct.unpack('!I', protocol_data[4:8])[0]
-            si = protocol_data[8]
-            ni = protocol_data[9]
-            mp = protocol_data[10]
-            sls = protocol_data[11]
-            if len(protocol_data) > 12:
-                sccp_data = protocol_data[12:]
-                self.parse_sccp_response(sccp_data, "SCCP Data")
-        except Exception as e:
-            self.log_error(f"Error parsing protocol data: {e}")
-    def parse_sccp_response(self, sccp_data, context):
-        try:
-            if len(sccp_data) < 5:
-                self.log_error(f"Signalling Connection Control Part")
-                self.log_error(f"    [Error: SCCP data too short]")
-                return
-            sccp_type = sccp_data[0]
-            protocol_class = sccp_data[1]
-            hop_counter = sccp_data[2]
-            ptr1 = sccp_data[3]
-            ptr2 = sccp_data[4]
-            ptr3 = sccp_data[5]
-            ptr4 = sccp_data[6]
-            sccp_type_name = {
-                SCCP_UDT: 'Unitdata',
-                SCCP_XUDT: 'Extended Unitdata',
-                SCCP_UDTS: 'Unitdata Service'
-            }.get(sccp_type, f'Unknown (0x{sccp_type:02X})')
-            addresses, tcap_offset = self.parse_sccp_addresses(sccp_data, 3)
-            if tcap_offset < len(sccp_data):
-                tcap_data = sccp_data[tcap_offset+3:]
-                self.parse_tcap_response(tcap_data)
-        except Exception as e:
-            self.log_error(f"Error parsing {context}: {e}")
-    def parse_tcap_response(self, tcap_data):
-        try:
-            if len(tcap_data) < 2:
-                self.log_error("Transaction Capabilities Application Part")
-                self.log_error("    [Error: TCAP data too short]")
-                return
-            tcap_tag = tcap_data[0]
-            tcap_len = tcap_data[1]
-            tcap_type = {TCAP_BEGIN: 'begin', TCAP_END: 'end', TCAP_CONTINUE: 'continue', TCAP_ABORT: 'abort'}.get(tcap_tag, 'Unknown')
-            transaction_id = None
-            for i in range(len(tcap_data) - 4):
-                if tcap_data[i] == 0x49:               
-                    tid_len = tcap_data[i + 1]
-                    if tid_len <= 4 and i + 2 + tid_len <= len(tcap_data):
-                        transaction_id = tcap_data[i + 2:i + 2 + tid_len]
-                        break
-            offset = 2
-            while offset < len(tcap_data):
-                if tcap_data[offset] == 0xA2:                   
-                    comp_len = tcap_data[offset + 1]
-                    if offset + 2 + comp_len <= len(tcap_data):
-                        comp_data = tcap_data[offset + 2:offset + 2 + comp_len]
-                    break
-                offset += 1
-        except Exception as e:
-            self.log_error(f"Error parsing TCAP response: {e}")
-    def parse_map_sri_sm_response(self, param_data):
-        try:
-            offset = 0
-            while offset < len(param_data):
-                tag = param_data[offset]
-                length = param_data[offset + 1]
-                value = param_data[offset + 2:offset + 2 + length]
-                if tag == ASN1_OCTET_STRING:
-                    digits = self.decode_bcd_digits(value)
-                elif tag == 0xA1:
-                    inner_offset = 0
-                    while inner_offset < len(value):
-                        inner_tag = value[inner_offset]
-                        inner_len = value[inner_offset + 1]
-                        inner_value = value[inner_offset + 2:inner_offset + 2 + inner_len]
-                        if inner_tag == ASN1_CONTEXT_0 and inner_value[0] == 0x91:
-                            digits = self.decode_bcd_digits(inner_value[1:])
-                        elif inner_tag == ASN1_CONTEXT_1:
-                            lmsi = struct.unpack('!I', inner_value)[0]
-                        inner_offset += 2 + inner_len
-                offset += 2 + length
-        except Exception as e:
-            self.log_error(f"Error parsing MAP SRI-SM response: {e}")
     def parse_m3ua_data(self, m3ua_msg, conn, addr):
         try:            
             self.log_debug(f"Incoming M3UA DATA from {addr[0]}:{addr[1]}")
@@ -2382,8 +2208,6 @@ class MAPSIGTRANServer:
                 if tcap_data and tcap_data[0] == TCAP_END:
                   self._on_dialogue_end_progress(tcap_data)
                 transaction_id, invoke_id, op_code, msisdn, _ = self.parse_tcap_message(tcap_data)
-                
-                # --- NEW: one-line summary for incoming MAP ---
                 self._log_map_1line(
                 direction="Recv",
                 opc=orig_pc, dpc=dest_pc,
@@ -2392,9 +2216,6 @@ class MAPSIGTRANServer:
                 tcap_data=tcap_data,
                 op_code=op_code
                 )
-
-                
-                # --- NEW: if this is SRI-SM ReturnResultLast, chain to MT-FSM ---
                 comp_tag = self._get_component_tag(tcap_data)
                 if comp_tag == 0xA2 and op_code == MAP_SRI_SM:
                     self.log_debug("ReturnResultLast for SRI-SM -> parse IMSI/NNN and send MT-FSM")                 
@@ -2431,16 +2252,14 @@ class MAPSIGTRANServer:
                                 bytes_sent = conn.send(response_data)
                                 if bytes_sent == len(response_data):
                                     self.log_debug(f"{CONFIG['local_pc']} → {CONFIG['remote_pc']} Send GSM MAP 232 SACK returnResultLast {op_code_description}")
-                                    
                                     self._log_map_1line(
                                     direction="Send",
                                     opc=CONFIG['local_pc'], dpc=CONFIG['remote_pc'],
                                     calling_gt=CONFIG.get('hlr_gt'),
                                     called_gt=addresses.get('calling', {}).get('gt'),
                                     tcap_data=response_tcap,
-                                    op_code=op_code  # 45 for SRI-SM
+                                    op_code=op_code                 
                                     )
-
                                 else:
                                     self.log_error(f"✗ Partial send: {bytes_sent}/{len(response_data)} bytes")
                             except Exception as e:
@@ -2545,10 +2364,8 @@ class MAPSIGTRANServer:
             sccp_type = SCCP_XUDT
             protocol_class = 0x80
             hop_counter = 0x0F
-
             called = SCCPAddress(gt=called_gt, ssn=called_ssn)
             calling = SCCPAddress(gt=calling_gt, ssn=calling_ssn)
-
             called_addr_data = called.pack()
             calling_addr_data = calling.pack()
             if not called_addr_data or not calling_addr_data:
@@ -2556,13 +2373,10 @@ class MAPSIGTRANServer:
                 return None
             assert called_addr_data[0] + 1 == len(called_addr_data), "Called length mismatch"
             assert calling_addr_data[0] + 1 == len(calling_addr_data), "Calling length mismatch"
-
-            # Same pointer layout as your response builder
             ptr1 = 4
             ptr2 = ptr1 + called_addr_data[0]
             ptr3 = ptr2 + calling_addr_data[0]
             ptr4 = 0
-
             sccp_header = struct.pack('!BBBBBBB', sccp_type, protocol_class, hop_counter,
                                       ptr1, ptr2, ptr3, ptr4)
             data_len = len(tcap_data)
@@ -2575,7 +2389,6 @@ class MAPSIGTRANServer:
         except Exception as e:
             self.log_error(f"Error creating SCCP UDT: {e}")
             return None
-
     def _send_sccp_tcap_on_active(self, tcap_data: bytes,
                                   called_gt: str, calling_gt: str,
                                   called_ssn: int = None, calling_ssn: int = None) -> bool:
@@ -2584,17 +2397,14 @@ class MAPSIGTRANServer:
             self.log_error("No ASP-ACTIVE association available. Wait for peer ASPUP/ASPAC.")
             return False
         if not called_gt:
-            self.log_error("Missing called_gt (destination GT). Set CONFIG['remote_gt'] or provide --smsc.")
+            self.log_error("Missing called_gt (destination GT). Set CONFIG['remote_gt']")
             return False
         if not calling_gt:
             self.log_error("Missing calling_gt (origin GT). Set CONFIG['msc_gt'] / ['hlr_gt'] / ['local_gt'].")
             return False
-
-        # Defaults if not explicitly provided by caller
         called_ssn = int(called_ssn if called_ssn is not None else CONFIG.get('called_ssn', 8))
         calling_ssn = int(calling_ssn if calling_ssn is not None else CONFIG.get('calling_ssn', 8))
         try:
-            # IMPORTANT: Use the new builder so roles are preserved
             sccp_pdu = self.create_sccp_udt(called_gt, called_ssn, calling_gt, calling_ssn, tcap_data)
             if not sccp_pdu:
                 self.log_error("Failed to build SCCP PDU for outgoing request.")
@@ -2602,7 +2412,6 @@ class MAPSIGTRANServer:
         except Exception as e:
             self.log_error(f"SCCP build error: {e}")
             return False
-
         try:
             m3ua_msg = self.create_m3ua_data_message(
                 dest_pc=CONFIG['remote_pc'],
@@ -2620,9 +2429,7 @@ class MAPSIGTRANServer:
         except Exception as e:
             self.log_error(f"M3UA build error: {e}")
             return False
-
         try:
-        
             _, _, op_code, _, _ = self.parse_tcap_message(tcap_data)
             self._log_map_1line(
             direction="Send",
@@ -2631,22 +2438,12 @@ class MAPSIGTRANServer:
             tcap_data=tcap_data,
             op_code=op_code
             )
-            #raw = m3ua_msg.pack()
             conn.sendall(raw)
             self.log_debug(f"{CONFIG['local_pc']} → {CONFIG['remote_pc']} M3UA DATA (SCCP + TCAP) sent")
             return True
         except Exception as e:
             self.log_error(f"Send error on active association {addr[0]}:{addr[1]}: {e}")
             return False
-
-    def _tcap_continue_with_component(self, our_otid: bytes, peer_otid: bytes, component: bytes) -> bytes:
-        body = self.encode_asn1_tag_length(0x48, our_otid) +\
-               self.encode_asn1_tag_length(0x49, peer_otid) +\
-               component
-        return self.encode_asn1_tag_length(0x65, body)
-    def _tcap_end_with_component(self, peer_otid: bytes, component: bytes) -> bytes:
-        body = self.encode_asn1_tag_length(0x49, peer_otid) + component
-        return self.encode_asn1_tag_length(0x64, body)
     def _make_concat_udh_8bit(self, ref: int, total: int, seq: int) -> bytes:
         return bytes([0x00, 0x03, ref & 0xFF, total & 0xFF, seq & 0xFF])
     def _plan_mo_segments(self, oa: str, da: str, text: str, smsc: str):
@@ -2659,8 +2456,10 @@ class MAPSIGTRANServer:
             if len(parts) >= 3:
                 ton = int(parts[0]); npi = int(parts[1])
                 digits = ''.join(ch for ch in ''.join(parts[2:]) if ch.isdigit())
-                return ton, npi, digits
-            return 1, 1, ''
+            else:            
+                ton, npi = 1, 1
+                digits = ''.join(ch for ch in s if ch.isdigit())
+            return ton, npi, digits            
         oa_ton, oa_npi, oa_digits = parse_addr(oa)
         da_ton, da_npi, da_digits = parse_addr(da)
         smsc_ton, smsc_npi, smsc_digits = parse_addr(smsc)
@@ -2737,21 +2536,6 @@ class MAPSIGTRANServer:
         param_seq = self.encode_asn1_tag_length(0x30, sm_rp_da + sm_rp_oa + sm_rp_ui)
         invoke_id_enc = self.encode_asn1_tag_length(0x02, bytes([random.randint(1, 127)]))
         invoke_id_enc = self.encode_asn1_tag_length(0x02, bytes([0]))
-        opcode_local = self.encode_asn1_tag_length(0x02, bytes([46]))               
-        invoke = self.encode_asn1_tag_length(0xA1, invoke_id_enc + opcode_local + param_seq)
-        return self.encode_asn1_tag_length(0x6C, invoke)                    
-    def _build_mo_fsm_component(self, oa_ton:int, oa_npi:int, oa_digits:str,
-                                smsc_ton:int, smsc_npi:int, smsc_digits:str,
-                                tpdu: bytes) -> bytes:
-        def _addr(ton,npi,digits) -> bytes:
-            toa = 0x80 | ((ton & 7) << 4) | (npi & 0x0F)
-            return bytes([toa]) + self.encode_bcd_digits(''.join(ch for ch in digits if ch.isdigit()))
-        sm_rp_da = self.encode_asn1_tag_length(0x84, _addr(smsc_ton, smsc_npi, smsc_digits))
-        sm_rp_oa = self.encode_asn1_tag_length(0x82, _addr(oa_ton, oa_npi, oa_digits))
-        rpdu = self._build_rp_mo_data(smsc_ton, smsc_npi, smsc_digits, tpdu)
-        sm_rp_ui = self.encode_asn1_tag_length(0x04, rpdu)
-        param_seq = self.encode_asn1_tag_length(0x30, sm_rp_da + sm_rp_oa + sm_rp_ui)
-        invoke_id_enc = self.encode_asn1_tag_length(0x02, bytes([random.randint(1,127)]))
         opcode_local = self.encode_asn1_tag_length(0x02, bytes([46]))               
         invoke = self.encode_asn1_tag_length(0xA1, invoke_id_enc + opcode_local + param_seq)
         return self.encode_asn1_tag_length(0x6C, invoke)                    
@@ -2834,7 +2618,7 @@ class MAPSIGTRANServer:
             return bytes([rp_mti, rp_mr]) + rp_da_ie + bytes([PID, DCS,UDL]) + UD
         smsc_str = smsc_str or CONFIG.get('smsc_gt') or CONFIG.get('remote_gt')
         if not smsc_str:
-            raise ValueError("No SMSC address configured (set CONFIG['smsc_gt'] or provide --smsc).")
+            raise ValueError("No SMSC address configured (set CONFIG['smsc_gt'].")
         oa_ton, oa_npi, oa_digits = _parse_ton_npi_digits(oa_str)                                  
         da_ton, da_npi, da_digits = _parse_ton_npi_digits(da_str)                             
         _ensure_digits("sm-RP-OA/OA", oa_digits)
@@ -2902,34 +2686,25 @@ class MAPSIGTRANServer:
             return
         if cmd in ('help', '?'):
             self.log_info("Commands:")
-            self.log_info("  mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]")
-            self.log_info("  mt <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]")
+            self.log_info("  mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> ")
+            self.log_info("  mt <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> ")
             self.log_info("  exit | quit")
             return          
-            
- 
         if cmd == 'mt':
             if len(parts) < 4:
-                self.log_error("Usage: mt <oa-ton.npi.originator> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]")
+                self.log_error("Usage: mt <oa-ton.npi.originator> <da-ton.npi.msisdn> <text> ")
                 return
-          
             originator = parts[1]
             msisdn = parts[2]
-            
-            #Gather text (supports spaces); ignore optional --smsc here (we use CONFIG['remote_gt'])
             text = ' '.join(parts[3:])
             self.log_debug(f"calling send_sri_sm ")
             ok = self.send_sri_sm(msisdn_addr=msisdn, originator=originator, text=text)
             if not ok:
                 self.log_error("SRI-SM send failed.")
             return
-
-
-            
-            
         if cmd == 'mo':
             if len(parts) < 4:
-                self.log_error("Usage: mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]")
+                self.log_error("Usage: mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> ")
                 return
             oa = parts[1]
             da = parts[2]
@@ -2983,7 +2758,6 @@ class MAPSIGTRANServer:
                     'next': 0,
                     'flow': 'MO',
                     'acn': ACN_SHORTMSG_MO_RELAY_V3,
-
                 }
                 ok = self._send_sccp_tcap_on_active(begin, called_gt, calling_gt)
                 if ok:
@@ -3017,8 +2791,8 @@ class MAPSIGTRANServer:
                 self.log_info(" - SRI-SM response with NNN and IMSI")
                 self.log_info(" - Wireshark-like PDU logging")
                 self.log_info(" - M3UA/SCCP/TCAP/MAP stack support")
-                self.log_info(" - Console commands: 'mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]'")
-                self.log_info(" - Console commands: 'mt <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> [--smsc ton.npi.addr]'")
+                self.log_info(" - Console commands: 'mo <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> '")
+                self.log_info(" - Console commands: 'mt <oa-ton.npi.msisdn> <da-ton.npi.msisdn> <text> '")
                 self.log_info(" ")
                 self.log_info("  mo 1.1.817085811456 1.1.817085811452 mo test")
                 self.log_info(" ")
@@ -3028,13 +2802,13 @@ class MAPSIGTRANServer:
                 self.log_info(" ")
                 self.log_info("  mt 1.1.817085811456 1.1.817085811452 mt 簡訊服務 SMS；有時也稱為訊息、簡訊、文字訊息")
                 self.log_info(" ")
-                self.log_info("  mo 1.1.817085811456 1.1.817085811452 SEG1 This is segment 1 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 1 proviSEG2 This is segment 2 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 2 proviSEG3 This is segment 3 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 3 provi --smsc 1.1.817090515123")
+                self.log_info("  mo 1.1.817085811456 1.1.817085811452 SEG1 This is segment 1 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 1 proviSEG2 This is segment 2 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 2 proviSEG3 This is segment 3 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 3 provi ")
                 self.log_info(" ")
-                self.log_info("  mt 1.1.817085811456 1.1.817085811452 SEG1 This is segment 1 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 1 proviSEG2 This is segment 2 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 2 proviSEG3 This is segment 3 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 3 provi --smsc 1.1.817090515123")
+                self.log_info("  mt 1.1.817085811456 1.1.817085811452 SEG1 This is segment 1 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 1 proviSEG2 This is segment 2 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 2 proviSEG3 This is segment 3 of the GSM/SMPP long message. It continues the structured transmission, ensuring clarity and coherence throughout. Segment 3 provi ")
                 self.log_info(" ")
-                self.log_info("  mo 1.1.817085811456 1.1.817085811452 當一則簡訊（SMS）超過標準長度限制時（例如 GSM 7-bit 編碼的 160 字元或 UCS-2 編碼的 70 字元），GSM 系統會使用（Concatenated SMS） 技術來分割並傳送訊息。每一部分都會附加一段特殊的資料，稱為 （UDH） UDH 是一段佔用空間的控制資訊，通常佔用 6 或 7 個位元組（bytes）。因此每一部分可用的字元數會比單一 SMS 少： GSM 7-bit 編碼：每段最多 153 字元 UCS-2 編碼：每段最多 67 字元 --smsc 1.1.817090515123")
+                self.log_info("  mo 1.1.817085811456 1.1.817085811452 當一則簡訊（SMS）超過標準長度限制時（例如 GSM 7-bit 編碼的 160 字元或 UCS-2 編碼的 70 字元），GSM 系統會使用（Concatenated SMS） 技術來分割並傳送訊息。每一部分都會附加一段特殊的資料，稱為 （UDH） UDH 是一段佔用空間的控制資訊，通常佔用 6 或 7 個位元組（bytes）。因此每一部分可用的字元數會比單一 SMS 少： GSM 7-bit 編碼：每段最多 153 字元 UCS-2 編碼：每段最多 67 字元 ")
                 self.log_info(" ")
-                self.log_info("  mt 1.1.817085811456 1.1.817085811452 當一則簡訊（SMS）超過標準長度限制時（例如 GSM 7-bit 編碼的 160 字元或 UCS-2 編碼的 70 字元），GSM 系統會使用（Concatenated SMS） 技術來分割並傳送訊息。每一部分都會附加一段特殊的資料，稱為 （UDH） UDH 是一段佔用空間的控制資訊，通常佔用 6 或 7 個位元組（bytes）。因此每一部分可用的字元數會比單一 SMS 少： GSM 7-bit 編碼：每段最多 153 字元 UCS-2 編碼：每段最多 67 字元 --smsc 1.1.817090515123")
+                self.log_info("  mt 1.1.817085811456 1.1.817085811452 當一則簡訊（SMS）超過標準長度限制時（例如 GSM 7-bit 編碼的 160 字元或 UCS-2 編碼的 70 字元），GSM 系統會使用（Concatenated SMS） 技術來分割並傳送訊息。每一部分都會附加一段特殊的資料，稱為 （UDH） UDH 是一段佔用空間的控制資訊，通常佔用 6 或 7 個位元組（bytes）。因此每一部分可用的字元數會比單一 SMS 少： GSM 7-bit 編碼：每段最多 153 字元 UCS-2 編碼：每段最多 67 字元 ")
                 self.log_info("=" * 60)
             self.running = True
             def _console_loop():
